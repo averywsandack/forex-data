@@ -1,0 +1,141 @@
+name: Pull OANDA data
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: "Instruments, comma-separated (e.g. EUR_USD,GBP_JPY) or ALL for the 28 FX pairs"
+        default: "ALL"
+      granularities:
+        description: "Comma-separated: M1,M5,M15,M30,H1,H4,D,W"
+        default: "D,H4,H1"
+      start:
+        description: "Optional start date YYYY-MM-DD (blank = resume or default history)"
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas
+
+      - name: Pull candles
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          PAIRS_IN: ${{ github.event.inputs.pairs || 'ALL' }}
+          GRANS_IN: ${{ github.event.inputs.granularities || 'D,H4,H1' }}
+          START_IN: ${{ github.event.inputs.start || '' }}
+        run: |
+          python - <<'PY'
+          import os, time, requests, pandas as pd
+
+          KEY = os.environ["OANDA_API_KEY"]
+          HOST = "https://api-fxpractice.oanda.com"
+          HDR = {"Authorization": "Bearer " + KEY}
+
+          ALL = [
+              "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
+              "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_CAD", "EUR_AUD", "EUR_NZD",
+              "GBP_JPY", "GBP_CHF", "GBP_CAD", "GBP_AUD", "GBP_NZD",
+              "AUD_JPY", "AUD_CHF", "AUD_CAD", "AUD_NZD",
+              "NZD_JPY", "NZD_CHF", "NZD_CAD",
+              "CAD_JPY", "CAD_CHF", "CHF_JPY",
+          ]
+          DEFAULT_START = {
+              "W": "2005-01-01", "D": "2005-01-01", "H4": "2005-01-01",
+              "H1": "2014-01-01", "M30": "2018-01-01", "M15": "2020-01-01",
+              "M5": "2022-01-01", "M1": "2024-01-01",
+          }
+
+          p_in = os.environ.get("PAIRS_IN", "ALL").strip()
+          if p_in.upper() == "ALL":
+              pairs = ALL
+          else:
+              pairs = [x.strip().upper().replace("/", "_") for x in p_in.split(",") if x.strip()]
+          grans = [x.strip().upper() for x in os.environ.get("GRANS_IN", "D,H4,H1").split(",") if x.strip()]
+          start_in = os.environ.get("START_IN", "").strip()
+
+          def pull(pair, gran, start):
+              rows = []
+              frm = start
+              while True:
+                  r = requests.get(
+                      HOST + "/v3/instruments/" + pair + "/candles",
+                      headers=HDR,
+                      params={
+                          "granularity": gran,
+                          "price": "MBA",
+                          "from": frm,
+                          "count": 5000,
+                          "dailyAlignment": 17,
+                          "alignmentTimezone": "America/New_York",
+                      },
+                      timeout=60,
+                  )
+                  if r.status_code != 200:
+                      print("ERROR", pair, gran, r.status_code, r.text[:200])
+                      break
+                  candles = r.json().get("candles", [])
+                  if not candles:
+                      break
+                  for x in candles:
+                      if not x.get("complete"):
+                          continue
+                      rows.append({
+                          "time": x["time"],
+                          "open": float(x["mid"]["o"]),
+                          "high": float(x["mid"]["h"]),
+                          "low": float(x["mid"]["l"]),
+                          "close": float(x["mid"]["c"]),
+                          "volume": x["volume"],
+                          "bid_close": float(x["bid"]["c"]),
+                          "ask_close": float(x["ask"]["c"]),
+                      })
+                  if len(candles) < 5000:
+                      break
+                  frm = candles[-1]["time"]
+                  time.sleep(0.1)
+              return pd.DataFrame(rows)
+
+          for gran in grans:
+              os.makedirs("data/" + gran, exist_ok=True)
+              for pair in pairs:
+                  path = "data/" + gran + "/" + pair + ".csv.gz"
+                  old = None
+                  if os.path.exists(path):
+                      old = pd.read_csv(path, compression="gzip")
+                  if start_in:
+                      start = start_in + "T00:00:00Z"
+                  elif old is not None and len(old):
+                      start = old["time"].iloc[-1]
+                  else:
+                      start = DEFAULT_START.get(gran, "2015-01-01") + "T00:00:00Z"
+                  df = pull(pair, gran, start)
+                  if df.empty and old is None:
+                      print("EMPTY", pair, gran)
+                      continue
+                  if old is not None:
+                      df = pd.concat([old, df])
+                  df = df.drop_duplicates("time", keep="last").sort_values("time")
+                  df.to_csv(path, index=False, compression="gzip")
+                  print(pair, gran, len(df), df["time"].iloc[0][:10], "->", df["time"].iloc[-1][:10])
+          PY
+
+      - name: Commit data
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data
+          git diff --cached --quiet || git commit -m "Update OANDA data"
+          git push
