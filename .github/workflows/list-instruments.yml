@@ -1,0 +1,46 @@
+name: List instruments
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch instruments
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os, json, requests
+          H = {"Authorization": "Bearer " + os.environ["OANDA_API_KEY"]}
+          HOST = "https://api-fxpractice.oanda.com"
+          accts = requests.get(HOST + "/v3/accounts", headers=H, timeout=60).json().get("accounts", [])
+          items = []
+          if accts:
+              r = requests.get(HOST + "/v3/accounts/" + accts[0]["id"] + "/instruments", headers=H, timeout=60).json()
+              items = r.get("instruments", [])
+          os.makedirs("meta", exist_ok=True)
+          json.dump({"instruments": items}, open("meta/instruments.json", "w"), indent=1)
+          print(len(items), "instruments saved")
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add meta
+          git diff --cached --quiet || git commit -m "Update instrument list"
+          git push
